@@ -12,7 +12,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -23,136 +23,8 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q skills/watch/scripts tests
 
-      - name: Run critical sandbox regression checks
-        shell: bash
-        run: |
-          python - <<'PY'
-          import sys
-          import tempfile
-          from pathlib import Path
+      - name: Install test runner
+        run: python -m pip install --disable-pip-version-check -q pytest
 
-          scripts = Path('skills/watch/scripts').resolve()
-          sys.path.insert(0, str(scripts))
-          import download
-
-          original_cmd = download._yt_dlp_command
-          original_public = download._fetch_public_youtube_transcript
-          download._yt_dlp_command = lambda: None
-          download._fetch_public_youtube_transcript = lambda _url, _out: None
-          try:
-              with tempfile.TemporaryDirectory() as td:
-                  result = download.download_url(
-                      'https://www.youtube.com/watch?v=BLR6S4Dfcmg',
-                      Path(td),
-                  )
-              assert result['video_path'] is None
-              assert result['downloaded'] is False
-              assert result['remote_video_unavailable'] is True
-          finally:
-              download._yt_dlp_command = original_cmd
-              download._fetch_public_youtube_transcript = original_public
-
-          with tempfile.TemporaryDirectory() as td:
-              target = Path(td) / 'fallback.vtt'
-              duration = download._write_public_transcript_vtt([
-                  {'text': 'hello', 'start': 0.5, 'duration': 1.25},
-                  {'text': 'world', 'start': 2.0, 'duration': 0.5},
-              ], target)
-              text = target.read_text(encoding='utf-8')
-              assert text.startswith('WEBVTT')
-              assert '00:00:00.500 --> 00:00:01.750' in text
-              assert duration == 2.5
-
-          entries, title, duration = download._parse_public_markdown(
-              '# Transcript: Demo\nLanguage: fr · Duration: 0:10 · Words: 4\n\n[0:00] hello\n\n[0:05] world\n'
-          )
-          assert title == 'Demo'
-          assert len(entries) == 2
-          assert entries[0]['start'] == 0.0
-          assert entries[0]['duration'] == 5.0
-          assert duration == 10.0
-
-          print('critical sandbox regression checks: PASS')
-          PY
-
-      - name: Smoke-test requested YouTube transcript without yt-dlp
-        shell: bash
-        env:
-          WATCH_PUBLIC_TRANSCRIPT_FALLBACK: 'true'
-        run: |
-          mkdir -p smoke
-          set +e
-          python skills/watch/scripts/watch.py \
-            'https://youtu.be/BLR6S4Dfcmg?si=vqlg5irqzSr1uR4q' \
-            --detail transcript \
-            --no-whisper \
-            --out-dir "$PWD/smoke/work" \
-            > smoke/report.txt \
-            2> smoke/stderr.txt
-          code=$?
-          echo "$code" > smoke/exit-code.txt
-          echo '===== watch stderr ====='
-          cat smoke/stderr.txt || true
-          echo '===== watch report header ====='
-          sed -n '1,18p' smoke/report.txt || true
-          echo "watch exit code: $code"
-          exit 0
-
-      - name: Install yt-dlp and ffmpeg for visual smoke test
-        shell: bash
-        timeout-minutes: 5
-        run: |
-          python -m pip install --disable-pip-version-check -q yt-dlp
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
-          python -m yt_dlp --version
-          ffmpeg -version | head -n 1
-
-      - name: Download short sample from requested video
-        shell: bash
-        timeout-minutes: 4
-        run: |
-          set +e
-          python -m yt_dlp \
-            --no-playlist \
-            --download-sections '*0-45' \
-            --force-keyframes-at-cuts \
-            -f 'bv*[height<=480]+ba/b[height<=480]/b' \
-            --merge-output-format mp4 \
-            -o "$PWD/smoke/sample.%(ext)s" \
-            'https://youtu.be/BLR6S4Dfcmg?si=vqlg5irqzSr1uR4q' \
-            > smoke/yt-dlp.txt 2>&1
-          code=$?
-          echo "$code" > smoke/visual-download-exit-code.txt
-          cat smoke/yt-dlp.txt
-          exit 0
-
-      - name: Run frame extraction on downloaded sample
-        shell: bash
-        run: |
-          set +e
-          sample=$(find "$PWD/smoke" -maxdepth 1 -type f \( -name 'sample.mp4' -o -name 'sample.webm' -o -name 'sample.mkv' \) | head -n 1)
-          if [ -z "$sample" ]; then
-            echo 'No sample video downloaded; visual smoke skipped.' | tee smoke/visual-report.txt
-            exit 0
-          fi
-          python skills/watch/scripts/watch.py "$sample" \
-            --detail efficient \
-            --max-frames 8 \
-            --no-whisper \
-            --out-dir "$PWD/smoke/visual-work" \
-            > smoke/visual-report.txt \
-            2> smoke/visual-stderr.txt
-          code=$?
-          echo "$code" > smoke/visual-exit-code.txt
-          cat smoke/visual-stderr.txt || true
-          sed -n '1,40p' smoke/visual-report.txt || true
-          exit 0
-
-      - name: Upload smoke-test output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: requested-video-smoke
-          path: smoke/
-          if-no-files-found: warn
+      - name: Test sandbox downloader fallbacks
+        run: pytest -q tests/test_download.py
