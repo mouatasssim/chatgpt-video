@@ -12,7 +12,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -98,15 +98,19 @@ jobs:
           echo "watch exit code: $code"
           exit 0
 
-      - name: Install yt-dlp for visual smoke test
+      - name: Install yt-dlp and ffmpeg for visual smoke test
         shell: bash
+        timeout-minutes: 5
         run: |
           python -m pip install --disable-pip-version-check -q yt-dlp
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
           python -m yt_dlp --version
           ffmpeg -version | head -n 1
 
       - name: Download short sample from requested video
         shell: bash
+        timeout-minutes: 4
         run: |
           set +e
           python -m yt_dlp \
