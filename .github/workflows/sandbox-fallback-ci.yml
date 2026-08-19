@@ -1,0 +1,58 @@
+name: Sandbox fallback CI
+
+on:
+  push:
+    branches:
+      - agent/chatgpt-sandbox-fallback
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Smoke-test requested YouTube video
+        shell: bash
+        run: |
+          mkdir -p smoke
+          set +e
+          python skills/watch/scripts/watch.py \
+            'https://youtu.be/BLR6S4Dfcmg?si=vqlg5irqzSr1uR4q' \
+            --detail efficient \
+            --max-frames 8 \
+            --no-whisper \
+            --out-dir "$PWD/smoke/work" \
+            > smoke/report.txt \
+            2> smoke/stderr.txt
+          code=$?
+          echo "$code" > smoke/exit-code.txt
+          echo '===== watch stderr ====='
+          cat smoke/stderr.txt || true
+          echo '===== watch report ====='
+          cat smoke/report.txt || true
+          echo "watch exit code: $code"
+          exit 0
+
+      - name: Upload smoke-test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: requested-video-smoke
+          path: smoke/
+          if-no-files-found: warn
