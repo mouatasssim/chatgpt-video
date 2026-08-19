@@ -101,7 +101,7 @@ def main() -> int:
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
-                transcript_source = "captions"
+                transcript_source = str(dl.get("transcript_source") or "captions")
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
@@ -232,7 +232,7 @@ def main() -> int:
             all_segments = parse_vtt(dl["subtitle_path"])
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
             transcript_text = format_transcript(transcript_segments)
-            transcript_source = "captions"
+            transcript_source = str(dl.get("transcript_source") or "captions")
         except Exception as exc:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
