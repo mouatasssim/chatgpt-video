@@ -1,7 +1,6 @@
 """Downloader regression tests for native and sandbox-safe paths."""
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -53,8 +52,6 @@ def test_download_url_requests_english_only(monkeypatch, tmp_path):
     calls = _capture_argv(monkeypatch)
     result = download.download_url(URL, tmp_path / "download")
     _assert_english_only(_sub_langs(calls[0]))
-    # No real file was produced by the stub: this is now a graceful degraded
-    # result instead of a hard SystemExit.
     assert result["video_path"] is None
     assert result["remote_video_unavailable"] is True
 
@@ -88,3 +85,17 @@ def test_public_transcript_vtt_writer(tmp_path):
     assert "00:00:00.500 --> 00:00:01.750" in body
     assert "hello" in body and "world" in body
     assert duration == pytest.approx(2.5)
+
+
+def test_public_timestamped_markdown_parser():
+    entries, title, duration = download._parse_public_markdown(
+        "# Transcript: Demo video\n"
+        "Language: fr · Duration: 0:10 · Words: 4\n\n"
+        "[0:00] hello\n\n"
+        "[0:05] world\n"
+    )
+    assert title == "Demo video"
+    assert len(entries) == 2
+    assert entries[0] == {"start": 0.0, "text": "hello", "duration": 5.0}
+    assert entries[1] == {"start": 5.0, "text": "world", "duration": 5.0}
+    assert duration == pytest.approx(10.0)
