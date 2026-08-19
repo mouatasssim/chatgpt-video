@@ -9,8 +9,8 @@ Sandbox-friendly behavior:
 - Falls back to ``python -m yt_dlp`` when the Python package is installed but
   the console script is not on PATH.
 - For public YouTube URLs, when yt-dlp is unavailable or fails before captions
-  can be fetched, it can use a public transcript API as a transcript-only
-  fallback. This keeps /watch useful in restricted ChatGPT/Codex sandboxes.
+  can be fetched, it can use a no-key public transcript endpoint as a
+  transcript-only fallback.
 - If remote video download itself is unavailable, returns a transcript-only
   result instead of aborting the whole /watch run. Local files are unaffected.
 """
@@ -19,17 +19,20 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
-PUBLIC_TRANSCRIPT_API = "https://getvideotranscript.com/api/youtube"
+PUBLIC_TRANSCRIPT_BASE = "https://youtube-transcript.ai/transcript"
+_TIMESTAMP_LINE = re.compile(r"^\[(\d+(?::\d{2}){1,2})\]\s*(.*)$")
+_DURATION_META = re.compile(r"\bDuration:\s*([0-9:]+)")
 
 
 def is_url(source: str) -> bool:
@@ -100,7 +103,7 @@ def _youtube_video_id(url: str) -> str | None:
     host = parsed.netloc.lower().split(":", 1)[0]
     if host.startswith("www."):
         host = host[4:]
-    if host in {"youtu.be"}:
+    if host == "youtu.be":
         candidate = parsed.path.strip("/").split("/", 1)[0]
         return candidate if len(candidate) == 11 else None
     if host not in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
@@ -113,6 +116,88 @@ def _youtube_video_id(url: str) -> str | None:
         candidate = parts[1]
         return candidate if len(candidate) == 11 else None
     return None
+
+
+def _parse_clock(value: str) -> float:
+    parts = value.strip().split(":")
+    if not parts or any(not p.isdigit() for p in parts):
+        raise ValueError(f"invalid timestamp: {value}")
+    nums = [int(p) for p in parts]
+    if len(nums) == 2:
+        minutes, seconds = nums
+        return float(minutes * 60 + seconds)
+    if len(nums) == 3:
+        hours, minutes, seconds = nums
+        return float(hours * 3600 + minutes * 60 + seconds)
+    raise ValueError(f"invalid timestamp: {value}")
+
+
+def _parse_public_markdown(markdown: str) -> tuple[list[dict], str | None, float]:
+    """Parse youtube-transcript.ai's timestamped Markdown into cue entries."""
+    title: str | None = None
+    duration_hint = 0.0
+    entries: list[dict] = []
+    current_start: float | None = None
+    current_text: list[str] = []
+    in_transcript = False
+
+    def flush() -> None:
+        nonlocal current_start, current_text
+        if current_start is None:
+            return
+        text = " ".join(part.strip() for part in current_text if part.strip()).strip()
+        if text:
+            entries.append({"start": current_start, "text": text})
+        current_start = None
+        current_text = []
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if line.startswith("# Transcript:") and title is None:
+            title = line.partition(":")[2].strip() or None
+        if duration_hint <= 0:
+            match_duration = _DURATION_META.search(line)
+            if match_duration:
+                try:
+                    duration_hint = _parse_clock(match_duration.group(1))
+                except ValueError:
+                    duration_hint = 0.0
+
+        match = _TIMESTAMP_LINE.match(line)
+        if match:
+            flush()
+            try:
+                current_start = _parse_clock(match.group(1))
+            except ValueError:
+                current_start = None
+                continue
+            current_text = [match.group(2)] if match.group(2).strip() else []
+            in_transcript = True
+            continue
+
+        if in_transcript and line:
+            current_text.append(line)
+
+    flush()
+    if not entries:
+        return [], title, duration_hint
+
+    for i, entry in enumerate(entries):
+        start = float(entry["start"])
+        if i + 1 < len(entries):
+            next_start = float(entries[i + 1]["start"])
+            duration = max(0.05, next_start - start)
+        elif duration_hint > start:
+            duration = max(0.05, duration_hint - start)
+        else:
+            duration = 5.0
+        entry["duration"] = duration
+
+    computed_duration = max(
+        float(entry["start"]) + float(entry["duration"])
+        for entry in entries
+    )
+    return entries, title, max(duration_hint, computed_duration)
 
 
 def _vtt_timestamp(seconds: float) -> str:
@@ -154,8 +239,9 @@ def _write_public_transcript_vtt(entries: list[dict], path: Path) -> float:
 def _fetch_public_youtube_transcript(url: str, out_dir: Path) -> dict | None:
     """Best-effort transcript-only fallback for public YouTube URLs.
 
-    The provider is intentionally used only after native yt-dlp access is
-    unavailable/failing. Disable with WATCH_PUBLIC_TRANSCRIPT_FALLBACK=false.
+    Uses youtube-transcript.ai's no-key timestamped Markdown endpoint only after
+    native yt-dlp access is unavailable/failing. Disable with
+    WATCH_PUBLIC_TRANSCRIPT_FALLBACK=false.
     """
     if not _public_fallback_enabled():
         return None
@@ -163,35 +249,42 @@ def _fetch_public_youtube_transcript(url: str, out_dir: Path) -> dict | None:
     if not video_id:
         return None
     out_dir.mkdir(parents=True, exist_ok=True)
-    endpoint = f"{PUBLIC_TRANSCRIPT_API}?video_id={quote(video_id)}"
-    req = Request(endpoint, headers={"User-Agent": "chatgpt-video/0.3 (+transcript-fallback)"})
+    endpoint = f"{PUBLIC_TRANSCRIPT_BASE}/{video_id}.txt"
+    req = Request(
+        endpoint,
+        headers={
+            "User-Agent": "chatgpt-video/0.3 (+transcript-fallback)",
+            "Accept": "text/markdown,text/plain;q=0.9,*/*;q=0.1",
+        },
+    )
     try:
         with urlopen(req, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            markdown = response.read().decode("utf-8", errors="replace")
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
         print(f"[watch] public transcript fallback unavailable: {exc}", file=sys.stderr)
         return None
 
-    entries = payload.get("transcript") if isinstance(payload, dict) else None
-    if not isinstance(entries, list) or not entries:
+    entries, title, duration_hint = _parse_public_markdown(markdown)
+    if not entries:
+        print("[watch] public transcript fallback returned no timestamped transcript", file=sys.stderr)
         return None
 
     subtitle_path = out_dir / "video.public.en.vtt"
-    duration = _write_public_transcript_vtt(entries, subtitle_path)
+    vtt_duration = _write_public_transcript_vtt(entries, subtitle_path)
     if not subtitle_path.exists():
         return None
-    print("[watch] using public YouTube transcript fallback", file=sys.stderr)
+    print("[watch] using no-key public YouTube transcript fallback", file=sys.stderr)
     return {
         "video_path": None,
         "subtitle_path": str(subtitle_path),
         "info": {
-            "title": None,
+            "title": title,
             "uploader": None,
-            "duration": duration,
+            "duration": max(duration_hint, vtt_duration),
             "url": url,
         },
         "downloaded": False,
-        "transcript_source": "public transcript API",
+        "transcript_source": "youtube-transcript.ai",
         "remote_video_unavailable": True,
     }
 
@@ -302,9 +395,10 @@ def download_url(
             "continuing transcript/metadata-only instead of aborting.",
             file=sys.stderr,
         )
+        subtitle = _pick_subtitle(out_dir)
         return {
             "video_path": None,
-            "subtitle_path": str(_pick_subtitle(out_dir)) if _pick_subtitle(out_dir) else None,
+            "subtitle_path": str(subtitle) if subtitle else None,
             "info": _read_info(out_dir / "video.info.json", url) or {"url": url},
             "downloaded": False,
             "remote_video_unavailable": True,
