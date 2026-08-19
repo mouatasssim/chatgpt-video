@@ -3,18 +3,14 @@
 
 Modes:
   setup.py --check      Silent preflight. Exit 0 if ready, 2/3/4 on failure.
-  setup.py --json       Machine-readable status for Claude to parse.
-  setup.py              Installer. Auto-installs deps, scaffolds .env, marks SETUP_COMPLETE.
+  setup.py --json       Machine-readable status for the agent to parse.
+  setup.py              Installer/scaffolder.
 
-Design:
-- Silent on success: --check exits 0 with no output when everything's ready so
-  that /watch doesn't spam "setup is complete" on every turn.
-- Idempotent: re-running the installer is safe — it never clobbers existing
-  keys and only appends missing ones.
-- SETUP_COMPLETE=true in ~/.config/watch/.env tells us the user has been
-  through a successful installer run at least once.
-- Never sudo. On macOS, auto-install via brew. Elsewhere, print exact commands.
-- Never write an API key to disk automatically — only scaffold placeholders.
+Sandbox note:
+``yt-dlp`` is intentionally an optional dependency now. Local video analysis
+still needs ffmpeg/ffprobe, while public YouTube transcript-only mode can fall
+back when yt-dlp is unavailable. Full remote visual frame extraction still
+benefits from yt-dlp and setup reports it under ``missing_optional_binaries``.
 """
 from __future__ import annotations
 
@@ -32,29 +28,28 @@ if str(SCRIPT_DIR) not in sys.path:
 from config import get_config  # noqa: E402
 
 
-REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
+REQUIRED_BINARIES = ["ffmpeg", "ffprobe"]
+OPTIONAL_BINARIES = ["yt-dlp"]
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
 ENV_TEMPLATE = """# /watch API configuration
 #
-# Whisper transcription fallback — used only when yt-dlp cannot get captions
+# Whisper transcription fallback — used when native captions are unavailable
 # (or when you point /watch at a local file with no subtitles).
 #
-# Groq is preferred: it runs whisper-large-v3 at a fraction of OpenAI's price
-# and is faster in practice. OpenAI is the compatible fallback.
-#
-# Get a Groq key:  https://console.groq.com/keys
-# Get an OpenAI key:  https://platform.openai.com/api-keys
-#
-# Leave both blank to disable Whisper — /watch will still work, but videos
-# without native captions will come back frames-only.
+# Groq is preferred; OpenAI is the compatible fallback.
+# Leave both blank if you do not want Whisper.
 
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
-# Default watch behavior (the /watch first-run wizard sets this for you).
+# Public YouTube transcript-only fallback.
+# Used only when native yt-dlp caption access is unavailable/failing.
+# Set false to disable the third-party public transcript fallback entirely.
+WATCH_PUBLIC_TRANSCRIPT_FALLBACK=true
+
+# Default watch behavior.
 # Allowed values: transcript | efficient | balanced | token-burner
-# Keep the value on its own line with no trailing comment.
 # WATCH_DETAIL=balanced
 """
 
@@ -63,16 +58,18 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
-def _check_binaries() -> list[str]:
+def _check_required_binaries() -> list[str]:
     return [b for b in REQUIRED_BINARIES if not _which(b)]
+
+
+def _check_optional_binaries() -> list[str]:
+    return [b for b in OPTIONAL_BINARIES if not _which(b)]
 
 
 _PERM_WARNED: set[str] = set()
 
 
 def _check_file_permissions(path: Path) -> None:
-    """Warn to stderr (once per path per process) if a secrets file is
-    world/group readable."""
     key = str(path)
     if key in _PERM_WARNED:
         return
@@ -122,12 +119,10 @@ def _have_api_key() -> tuple[bool, str | None]:
 
 
 def is_first_run() -> bool:
-    """True if the installer hasn't completed successfully yet."""
     return _read_env_key("SETUP_COMPLETE") != "true"
 
 
 def _scaffold_env() -> bool:
-    """Create ~/.config/watch/.env with placeholders if missing."""
     if CONFIG_FILE.exists():
         return False
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -139,28 +134,31 @@ def _scaffold_env() -> bool:
     return True
 
 
-def _write_setup_complete() -> None:
-    """Idempotently append SETUP_COMPLETE=true to .env.
-
-    Used only after a fully successful install (deps + key). Future sessions
-    detect this marker to skip wizard-style UI and stay silent.
-    """
+def _set_env_value(name: str, value: str) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    existing = ""
-    if CONFIG_FILE.exists():
-        existing = CONFIG_FILE.read_text(encoding="utf-8")
-        for line in existing.splitlines():
-            if line.strip().startswith("SETUP_COMPLETE="):
-                return
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        CONFIG_FILE.write_text(existing + "SETUP_COMPLETE=true\n", encoding="utf-8")
-    else:
-        CONFIG_FILE.write_text(ENV_TEMPLATE + "\nSETUP_COMPLETE=true\n", encoding="utf-8")
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(ENV_TEMPLATE, encoding="utf-8")
+    lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+    prefix = name + "="
+    replaced = False
+    out: list[str] = []
+    for line in lines:
+        if line.strip().startswith(prefix):
+            out.append(f"{name}={value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{name}={value}")
+    CONFIG_FILE.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
     try:
         CONFIG_FILE.chmod(0o600)
     except OSError:
         pass
+
+
+def _write_setup_complete() -> None:
+    _set_env_value("SETUP_COMPLETE", "true")
 
 
 def _brew_pkg(missing: list[str]) -> list[str]:
@@ -194,39 +192,30 @@ def _install_macos(missing: list[str]) -> tuple[bool, str]:
     return True, f"installed via brew: {', '.join(pkgs)}"
 
 
-def _install_hint_linux(missing: list[str]) -> str:
-    pkgs = _brew_pkg(missing)
-    hints = []
-    if "ffmpeg" in pkgs:
-        hints.append("apt: `sudo apt install ffmpeg` or dnf: `sudo dnf install ffmpeg`")
-    if "yt-dlp" in pkgs:
-        hints.append("`pipx install yt-dlp` (recommended) or `pip install --user yt-dlp`")
-    return "\n  ".join(hints) if hints else "nothing to install"
+def _required_hint_linux(missing: list[str]) -> str:
+    if any(b in missing for b in ("ffmpeg", "ffprobe")):
+        return "apt: `sudo apt install ffmpeg` or dnf: `sudo dnf install ffmpeg`"
+    return "nothing to install"
 
 
-def _install_hint_windows(missing: list[str]) -> str:
-    pkgs = _brew_pkg(missing)
-    hints = []
-    if "ffmpeg" in pkgs:
-        hints.append("winget: `winget install Gyan.FFmpeg`")
-    if "yt-dlp" in pkgs:
-        hints.append("winget: `winget install yt-dlp.yt-dlp` or pip: `pip install --user yt-dlp`")
-    return "\n  ".join(hints) if hints else "nothing to install"
+def _required_hint_windows(missing: list[str]) -> str:
+    if any(b in missing for b in ("ffmpeg", "ffprobe")):
+        return "winget: `winget install Gyan.FFmpeg`"
+    return "nothing to install"
+
+
+def _yt_dlp_hint(system: str | None = None) -> str:
+    system = system or platform.system()
+    if system == "Windows":
+        return "`winget install yt-dlp.yt-dlp` or `python -m pip install -U yt-dlp`"
+    if system == "Darwin":
+        return "`brew install yt-dlp` or `python3 -m pip install -U yt-dlp`"
+    return "`pipx install yt-dlp` or `python3 -m pip install --user -U yt-dlp`"
 
 
 def _status() -> dict:
-    """Structured preflight snapshot.
-
-    `status` describes the *ideal* state (a Whisper key is encouraged), so a
-    keyless install still reports `needs_key` on the very first run — that's
-    the agent's cue to encourage adding one.
-
-    `can_proceed` is the operational gate: /watch can run as long as the
-    binaries are present AND the user has either set a key or already finished
-    setup (consciously opting out of Whisper). A keyless user who completed
-    setup is NOT nagged on every call.
-    """
-    missing = _check_binaries()
+    missing = _check_required_binaries()
+    missing_optional = _check_optional_binaries()
     has_key, backend = _have_api_key()
     setup_complete = not is_first_run()
 
@@ -240,7 +229,6 @@ def _status() -> dict:
         status = "needs_key"
 
     can_proceed = (not missing) and (has_key or setup_complete)
-
     cfg = get_config()
     return {
         "status": status,
@@ -248,6 +236,8 @@ def _status() -> dict:
         "first_run": not setup_complete,
         "setup_complete": setup_complete,
         "missing_binaries": missing,
+        "missing_optional_binaries": missing_optional,
+        "remote_video_frames_available": "yt-dlp" not in missing_optional,
         "whisper_backend": backend,
         "has_api_key": has_key,
         "config_file": str(CONFIG_FILE),
@@ -257,26 +247,15 @@ def _status() -> dict:
 
 
 def cmd_check() -> int:
-    """Silent-on-success preflight.
-
-    Exit 0 with no output when /watch can run. A keyless user who already
-    finished setup (SETUP_COMPLETE=true) counts as ready — Whisper is
-    encouraged, not required — so they are never nagged on follow-up calls.
-
-    On a state that blocks /watch, print one actionable line to stderr:
-      2 → binaries missing
-      3 → genuine first run with no API key (encourage one)
-      4 → both missing
-    """
     s = _status()
     if s["can_proceed"]:
         return 0
 
     parts = []
     if s["missing_binaries"]:
-        parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
+        parts.append(f"missing required binaries: {', '.join(s['missing_binaries'])}")
     if not s["has_api_key"] and not s["setup_complete"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+        parts.append("no Whisper API key (optional, but first-run choice not completed)")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
@@ -298,31 +277,28 @@ def cmd_json() -> int:
 
 
 def cmd_install() -> int:
-    missing = _check_binaries()
-    installed_deps = False
+    missing = _check_required_binaries()
+    system = platform.system()
     if missing:
-        system = platform.system()
         if system == "Darwin":
             ok, msg = _install_macos(missing)
             print(f"[setup] {msg}", file=sys.stderr)
             if not ok:
                 return 2
-            still_missing = _check_binaries()
+            still_missing = _check_required_binaries()
             if still_missing:
                 print(f"[setup] still missing after install: {', '.join(still_missing)}", file=sys.stderr)
                 return 2
-            installed_deps = True
         elif system == "Linux":
-            print("[setup] dependencies missing on Linux — please install:", file=sys.stderr)
-            print("  " + _install_hint_linux(missing), file=sys.stderr)
+            print("[setup] required dependencies missing on Linux — please install:", file=sys.stderr)
+            print("  " + _required_hint_linux(missing), file=sys.stderr)
             return 2
         elif system == "Windows":
-            print("[setup] dependencies missing on Windows — please install:", file=sys.stderr)
-            print("  " + _install_hint_windows(missing), file=sys.stderr)
+            print("[setup] required dependencies missing on Windows — please install:", file=sys.stderr)
+            print("  " + _required_hint_windows(missing), file=sys.stderr)
             return 2
         else:
-            print(f"[setup] unsupported platform ({system}) for auto-install. Install manually:", file=sys.stderr)
-            print(f"  missing: {', '.join(missing)}", file=sys.stderr)
+            print(f"[setup] unsupported platform ({system}) for auto-install; missing: {', '.join(missing)}", file=sys.stderr)
             return 2
 
     created = _scaffold_env()
@@ -331,23 +307,23 @@ def cmd_install() -> int:
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
 
-    has_key, backend = _have_api_key()
-    if has_key:
-        _write_setup_complete()
-        print(f"[setup] ready. whisper backend: {backend}")
-        if installed_deps:
-            print("[setup] installed dependencies; /watch is fully set up.")
-        return 0
+    missing_optional = _check_optional_binaries()
+    if "yt-dlp" in missing_optional:
+        print("")
+        print("[setup] yt-dlp is not available in this runtime.")
+        print("[setup] transcript-only fallback can still work for public YouTube videos.")
+        print(f"[setup] for full remote video/frame analysis install yt-dlp with: {_yt_dlp_hint(system)}")
 
-    print("")
-    print("[setup] one step left: add a Whisper API key.")
-    print("")
-    print(f"  Edit {CONFIG_FILE} and set either:")
-    print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
-    print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
-    print("")
-    print("  Without a key, /watch still works but videos without captions come back frames-only.")
-    return 3
+    has_key, backend = _have_api_key()
+    _write_setup_complete()
+    if has_key:
+        print(f"[setup] ready. whisper backend: {backend}")
+    else:
+        print("")
+        print("[setup] ready without Whisper API key.")
+        print("[setup] native/public captions can still work; videos with no captions may be frames-only.")
+        print(f"[setup] optional keys can be added later in {CONFIG_FILE}")
+    return 0
 
 
 def main() -> int:
